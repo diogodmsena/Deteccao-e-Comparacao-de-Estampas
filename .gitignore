@@ -1,0 +1,58 @@
+# ====================================================================
+# Arquivo .gitignore para o Sistema de Comparação de Estampas
+# ====================================================================
+
+# 1. Ambientes Virtuais (Python)
+# Ignora o ambiente virtual que você criou
+venv/
+.venv/
+env/
+.env/
+
+# 2. Cache e Artefatos do Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# 3. Arquivos de Sistema Operacional e IDE
+.DS_Store
+Thumbs.db
+.vscode/
+*.log
+
+# 4. Jupyter Notebooks
+# Ignora os checkpoints, mas mantém os arquivos .ipynb
+.ipynb_checkpoints/
+
+# 5. Dependências e Modelos Baixados
+# Ignora modelos YOLO baixados (ex: yolov8n.pt), mas NÃO seus modelos treinados
+yolo_weights/*.pt
+
+# 6. Datasets e Saídas de Treinamento
+# Ignora o dataset de treinamento (geralmente muito grande para Git)
+dataset_treinamento/
+triplet_dataset/
+
+# Ignora os resultados/logs do treinamento YOLO
+runs/
+
+# 7. Arquivos de Saída e Cache do Projeto
+# Ignora os diretórios de saída e monitoramento
+results/
+monitored_input/
+
+# Ignora o cache de embeddings (será recriado automaticamente)
+checkpoints/
+
+# Ignora o histórico do K-Fold (é um resultado, não código-fonte)
+checkpoints/kfold_history.json
+
+# 8. Diretórios Monitorados (Input)
+# Ignora o CONTEÚDO dos diretórios de validação/input,
+# mas mantém os próprios diretórios (assumindo que você adicione um .gitkeep neles)
+imagens_validacao/*
+!imagens_validacao/.gitkeep
+
+monitored_input/*
+!monitored_input/.gitkeep
