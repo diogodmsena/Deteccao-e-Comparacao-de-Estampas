@@ -1,0 +1,6 @@
+weights: models/estampa_yolov8_best.pt
+conf: 0.30
+iou: 0.55
+imgsz: 640
+device: "0"
+select_strategy: "confidence"  # ou "area"

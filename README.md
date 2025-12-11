@@ -43,12 +43,6 @@ O Sistema de Detecção e Comparação de Estampas é uma solução de visão co
 * ultralytics (para YOLOv8)
 * GPU compatível com CUDA (altamente recomendado para desempenho ideal)
 
-Ótima ideia. A sua experiência de troubleshooting é um ponto crucial que deve estar na documentação. A diferença entre rodar na CPU e na GPU é a diferença entre um sistema funcional e um sistema inutilizável em produção.
-
-Aqui está a seção `## Instalação` do seu `README.md`, atualizada com suas observações, explicando a importância de instalar a versão correta do PyTorch e como verificar se a GPU está realmente habilitada.
-
-Basta copiar e colar esta seção inteira, substituindo a seção `## Instalação` original no seu arquivo.
-
 -----
 
 ## Instalação
@@ -198,7 +192,7 @@ Você pode especificar outros parâmetros de treinamento via linha de comando ou
 Para executar o sistema de comparação, seja manualmente ou via monitoramento de diretório:
 
 ```bash
-python main.py run_comparison --input_path ./path/to/image_or_folder --output_path ./results --monitor True --config_path ./config.py
+python sistema_estampas.py executar
 ```
 
 * `--input_path`: Caminho para uma imagem ou diretório de imagens a serem processadas.

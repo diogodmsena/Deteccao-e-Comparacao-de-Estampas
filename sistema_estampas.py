@@ -4,6 +4,9 @@ Pipeline: YOLOv8/RFDETR (Detecção) → Siamese Network (Comparação) → K-Fo
 Otimizações: TorchScript JIT, Half Precision, Batch Processing
 Data: 2025
 """
+import os
+os.environ.setdefault("OMP_NUM_THREADS", "1")
+os.environ.setdefault("MKL_NUM_THREADS", "1")
 
 import torch
 import torch.nn as nn
@@ -12,13 +15,13 @@ import torchvision.transforms as transforms
 from torchvision.models import resnet50, ResNet50_Weights
 from torch.utils.data import Dataset, DataLoader, SubsetRandomSampler
 from PIL import Image, ImageDraw
-import os
 from pathlib import Path
 from watchdog.observers import Observer
 from watchdog.events import FileSystemEventHandler
 import time
 from datetime import datetime
 import numpy as np
+import cv2
 from typing import Tuple, List, Optional, Dict
 import json
 from sklearn.model_selection import KFold
@@ -35,26 +38,53 @@ except ImportError:
 
 # ==================== CONFIGURAÇÕES ====================
 class Config:
+    """Configurações carregadas de arquivo externo"""
+    # Valores padrão (caso o json falhe)
+    config_data = {}
+    try:
+        with open("config.json", "r") as f:
+            config_data = json.load(f)
+            print("✓ Configurações carregadas do config.json")
+    except FileNotFoundError:
+        print("⚠ config.json não encontrado, usando defaults do código.")
+
+    # Diretórios (lendo do JSON ou usando default)
+    DIR_REFERENCIA = config_data.get("DIR_REFERENCIA", "./imagens_referencia")
+    DIR_VALIDACAO = config_data.get("DIR_VALIDACAO", "./imagens_validacao")
+    DIR_CHECKPOINTS = config_data.get("DIR_CHECKPOINTS", "./checkpoints")
+    DIR_YOLO_WEIGHTS = config_data.get("DIR_YOLO_WEIGHTS", "./models")
+    
+    # Modelos
+    YOLO_MODEL = config_data.get("YOLO_MODEL", "estampa_yolov8n_best.pt")
+    
     """Configurações centralizadas do sistema"""
     # Diretórios
-    DIR_REFERENCIA = "./imagens_referencia"
-    DIR_VALIDACAO = "./imagens_validacao"
     DIR_TREINAMENTO = "./dataset_treinamento"
-    DIR_CHECKPOINTS = "./checkpoints"
-    DIR_YOLO_WEIGHTS = "./yolo_weights"
     
     # Parâmetros de comparação
-    THRESHOLD_SIMILARIDADE = 0.85
+    THRESHOLD_SIMILARIDADE = config_data.get("THRESHOLD_SIMILARIDADE", 0.95)
     EMBEDDING_SIZE = 512
     DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     EXTENSOES_VALIDAS = {'.jpg', '.jpeg', '.png', '.bmp'}
     
     # Parâmetros de detecção YOLOv8
-    YOLO_MODEL = "yolov8n.pt"  # nano (mais rápido) ou yolov8s.pt (mais preciso)
-    YOLO_CONFIDENCE = 0.25
-    YOLO_IOU_THRESHOLD = 0.45
+    YOLO_CONFIDENCE = 0.30
+    YOLO_IOU_THRESHOLD = 0.55
     YOLO_IMGSZ = 640
+    YOLO_SELECT_STRATEGY = "confidence"
     CLASSE_ESTAMPA = 0  # Ajustar conforme fine-tuning do YOLO
+
+    # Treino YOLO (opcional, se usar fine_tune_yolo)
+    YOLO_BATCH = 16
+    YOLO_RUN_NAME = "estampas_detector"
+    YOLO_HYP = "configs/hyp_estampas.yaml"      # se existir no seu projeto
+    YOLO_CLOSE_MOSAIC = 10
+    YOLO_PATIENCE = 30
+    YOLO_COS_LR = True
+    YOLO_OPTIMIZER = "sgd"
+    YOLO_LR0 = 0.005
+    YOLO_LRF = 0.1
+    YOLO_AMP = True
     
     # Parâmetros de otimização de inferência
     USE_HALF_PRECISION = True  # FP16 para GPUs modernas
@@ -83,130 +113,313 @@ class DetectorEstampaYOLO:
     """
     Detector de estampas usando YOLOv8.
     Otimizado para inferência em tempo real.
+    Mantém a interface pública original e acrescenta:
+      - Estratégia de seleção de caixa ("confidence" ou "area") via config
+      - Parametrização explícita de conf/iou/imgsz a partir do objeto Config
+      - Robustez no tratamento de coordenadas e ausência de detecções
     """
-    def __init__(self, config: Config):
+
+    def __init__(self, config: "Config"):
         self.config = config
-        
+
         if not YOLO_DISPONIVEL:
             raise ImportError("YOLOv8 não disponível. Instale: pip install ultralytics")
-        
-        # Carrega modelo YOLOv8
+
+        # Caminho do modelo (peso treinado)
         model_path = Path(config.DIR_YOLO_WEIGHTS) / config.YOLO_MODEL
-        
         if not model_path.exists():
             print(f"📥 Baixando modelo YOLOv8: {config.YOLO_MODEL}")
-            model_path = config.YOLO_MODEL  # Baixa automaticamente
-        
+            model_path = config.YOLO_MODEL  # Ultralytics baixa automaticamente se for alias oficial
+
+        # Carrega o modelo
         self.model = YOLO(str(model_path))
-        
+
+        # Força device explícito em string para Ultralytics
+        self._device_str = None
+        if getattr(self.config, "DEVICE", None) is not None:
+            try:
+                # torch.device('cuda:0') -> "0"; CPU -> "cpu"
+                if self.config.DEVICE.type == "cuda":
+                    self._device_str = "0"  # ajuste se usar múltiplas GPUs
+                else:
+                    self._device_str = "cpu"
+            except Exception:
+                self._device_str = None
+
+        # Warmup: uma imagem dummy (mais estabilidade de latência)
+        try:
+            import numpy as np
+            dummy = np.zeros((self.config.YOLO_IMGSZ, self.config.YOLO_IMGSZ, 3), dtype=np.uint8)
+            _ = self.model.predict(source=dummy,
+                                   conf=self.config.YOLO_CONFIDENCE,
+                                   iou=self.config.YOLO_IOU_THRESHOLD,
+                                   imgsz=self.config.YOLO_IMGSZ,
+                                   verbose=False,
+                                   half=getattr(self.config, "USE_HALF_PRECISION", False),
+                                   stream=False,
+                                   device=self._device_str)
+        except Exception:
+            pass
+
+        # Estratégia de seleção de caixa: "confidence" (padrão) ou "area"
+        self._select_strategy = getattr(self.config, "YOLO_SELECT_STRATEGY", "confidence")
+        if self._select_strategy not in ("confidence", "area"):
+            self._select_strategy = "confidence"
+
         # Otimizações
-        if config.USE_HALF_PRECISION and config.DEVICE.type == 'cuda':
-            self.model.model.half()
-            print("✓ Half Precision (FP16) ativado para YOLOv8")
-        
+        # Half Precision (FP16) somente em CUDA
+        if getattr(self.config, "USE_HALF_PRECISION", False) and getattr(self.config, "DEVICE", None) is not None:
+            try:
+                if self.config.DEVICE.type == "cuda":
+                    # Em alguns builds, .model.half() é suportado; Ultralytics também aceita half no predict()
+                    self.model.model.half()
+                    print("✓ Half Precision (FP16) ativado para YOLOv8")
+            except Exception as e:
+                # Não interrompe o fluxo se não suportado
+                print(f"⚠ Não foi possível ativar FP16 diretamente no modelo: {e}")
+
         print(f"✓ YOLOv8 carregado: {config.YOLO_MODEL}")
-    
+
+    def _choose_box_idx(
+        self,
+        boxes_xyxy: np.ndarray,
+        confidences: np.ndarray
+    ) -> int:
+        """
+        Seleciona o índice da caixa preferida conforme self._select_strategy.
+        - "confidence": maior confiança
+        - "area": maior área (w*h)
+        Retorna -1 se não houver caixas.
+        """
+        if boxes_xyxy is None or boxes_xyxy.shape[0] == 0:
+            return -1
+
+        if self._select_strategy == "area":
+            x1 = boxes_xyxy[:, 0]
+            y1 = boxes_xyxy[:, 1]
+            x2 = boxes_xyxy[:, 2]
+            y2 = boxes_xyxy[:, 3]
+            areas = np.maximum(0.0, x2 - x1) * np.maximum(0.0, y2 - y1)
+            return int(np.argmax(areas))
+
+        # Padrão: maior confiança
+        return int(np.argmax(confidences))
+
+    def _predict_internal(self, source, stream: bool = False):
+        """
+        Invólucro de predict para centralizar parâmetros.
+        source: caminho de imagem, lista de caminhos ou np.ndarray (BGR/RGB aceito pela Ultralytics)
+        stream: True para batches grandes, economiza memória
+        """
+        return self.model.predict(
+            source=source,
+            conf=self.config.YOLO_CONFIDENCE,
+            iou=self.config.YOLO_IOU_THRESHOLD,
+            imgsz=self.config.YOLO_IMGSZ,
+            verbose=False,
+            half=getattr(self.config, "USE_HALF_PRECISION", False),
+            stream=stream,
+            device=self._device_str
+        )
+
     def detectar_estampa(self, imagem_path: str) -> Optional[Tuple[int, int, int, int]]:
         """
         Detecta a região da estampa usando YOLOv8.
         Retorna: (x1, y1, x2, y2) ou None
         """
         try:
-            # Inferência YOLOv8
-            results = self.model.predict(
-                source=imagem_path,
-                conf=self.config.YOLO_CONFIDENCE,
-                iou=self.config.YOLO_IOU_THRESHOLD,
-                imgsz=self.config.YOLO_IMGSZ,
-                verbose=False,
-                half=self.config.USE_HALF_PRECISION
-            )
-            
-            if len(results) == 0 or len(results[0].boxes) == 0:
+            results = self._predict_internal(imagem_path, stream=False)
+
+            if len(results) == 0 or results[0].boxes is None or len(results[0].boxes) == 0:
                 return None
-            
-            # Pega a detecção com maior confiança
+
             boxes = results[0].boxes
+            # boxes.xyxy: (N, 4), boxes.conf: (N,)
+            xyxy = boxes.xyxy.cpu().numpy()
             confidences = boxes.conf.cpu().numpy()
-            best_idx = np.argmax(confidences)
-            
-            # Extrai coordenadas (xyxy format)
-            bbox = boxes.xyxy[best_idx].cpu().numpy().astype(int)
-            x1, y1, x2, y2 = bbox
-            
+
+            # Seleciona caixa final conforme estratégia
+            best_idx = self._choose_box_idx(xyxy, confidences)
+            if best_idx < 0:
+                return None
+
+            bbox = xyxy[best_idx].astype(int)
+            x1, y1, x2, y2 = int(bbox[0]), int(bbox[1]), int(bbox[2]), int(bbox[3])
+
+            # Clamping defensivo (coordenadas não negativas, x2>x1, y2>y1)
+            x1, y1 = max(0, x1), max(0, y1)
+            x2, y2 = max(x1 + 1, x2), max(y1 + 1, y2)
+
             return (x1, y1, x2, y2)
-            
+
         except Exception as e:
             print(f"✗ Erro na detecção YOLOv8: {e}")
             return None
-    
+
     def detectar_batch(self, imagens_paths: List[str]) -> List[Optional[Tuple[int, int, int, int]]]:
         """
         Detecta estampas em múltiplas imagens (batch processing).
         Muito mais eficiente que processar uma por uma.
+        Retorna lista de bboxes ou None por imagem na mesma ordem da entrada.
         """
         try:
-            results = self.model.predict(
-                source=imagens_paths,
-                conf=self.config.YOLO_CONFIDENCE,
-                iou=self.config.YOLO_IOU_THRESHOLD,
-                imgsz=self.config.YOLO_IMGSZ,
-                verbose=False,
-                half=self.config.USE_HALF_PRECISION,
-                stream=True  # Streaming para economizar memória
-            )
-            
-            bboxes = []
-            for result in results:
-                if len(result.boxes) == 0:
+            results_iter = self._predict_internal(imagens_paths, stream=True)
+
+            bboxes: List[Optional[Tuple[int, int, int, int]]] = []
+            for result in results_iter:
+                if result.boxes is None or len(result.boxes) == 0:
                     bboxes.append(None)
-                else:
-                    boxes = result.boxes
-                    confidences = boxes.conf.cpu().numpy()
-                    best_idx = np.argmax(confidences)
-                    bbox = boxes.xyxy[best_idx].cpu().numpy().astype(int)
-                    x1, y1, x2, y2 = bbox
-                    bboxes.append((x1, y1, x2, y2))
-            
+                    continue
+
+                boxes = result.boxes
+                xyxy = boxes.xyxy.cpu().numpy()
+                confidences = boxes.conf.cpu().numpy()
+
+                best_idx = self._choose_box_idx(xyxy, confidences)
+                if best_idx < 0:
+                    bboxes.append(None)
+                    continue
+
+                bbox = xyxy[best_idx].astype(int)
+                x1, y1, x2, y2 = int(bbox[0]), int(bbox[1]), int(bbox[2]), int(bbox[3])
+
+                # Clamping defensivo
+                x1, y1 = max(0, x1), max(0, y1)
+                x2, y2 = max(x1 + 1, x2), max(y1 + 1, y2)
+
+                bboxes.append((x1, y1, x2, y2))
+
             return bboxes
-            
+
         except Exception as e:
             print(f"✗ Erro na detecção batch: {e}")
             return [None] * len(imagens_paths)
-    
+
     def extrair_estampa(self, imagem_path: str, bbox: Tuple[int, int, int, int]) -> Optional[Image.Image]:
-        """Extrai a região da estampa"""
+        """
+        Extrai a região da estampa a partir do bounding box.
+        Retorna PIL.Image ou None em caso de falha.
+        """
         try:
-            img = Image.open(imagem_path).convert('RGB')
+            img = Image.open(imagem_path).convert("RGB")
             x1, y1, x2, y2 = bbox
+
+            # Boundaries defensivos
+            w, h = img.size
+            x1 = int(max(0, min(x1, w - 1)))
+            y1 = int(max(0, min(y1, h - 1)))
+            x2 = int(max(1, min(x2, w)))
+            y2 = int(max(1, min(y2, h)))
+            if x2 <= x1 or y2 <= y1:
+                return None
+
             estampa = img.crop((x1, y1, x2, y2))
             return estampa
+
         except Exception as e:
             print(f"✗ Erro ao extrair estampa: {e}")
             return None
-    
+
     def fine_tune_yolo(self, dataset_path: str, epochs: int = 50):
         """
         Fine-tuning do YOLOv8 para detecção específica de estampas.
-        Dataset deve estar no formato YOLO (data.yaml).
+        Dataset deve estar no formato YOLO (data.yaml ou caminho com data.yaml).
+        Usa parâmetros de treino da própria Config quando disponíveis.
         """
-        print(f"\n{'='*70}")
-        print(f"🎯 FINE-TUNING YOLOV8 PARA DETECÇÃO DE ESTAMPAS")
-        print(f"{'='*70}\n")
-        
+        print(f"\n{'=' * 70}")
+        print("🎯 FINE-TUNING YOLOv8 PARA DETECÇÃO DE ESTAMPAS")
+        print(f"{'=' * 70}\n")
+
+        # Parâmetros base vindos de Config, com defaults seguros
+        imgsz = getattr(self.config, "YOLO_IMGSZ", 640)
+        batch = getattr(self.config, "YOLO_BATCH", 16)
+        device = getattr(self.config, "DEVICE", 0)
+        project = getattr(self.config, "DIR_YOLO_WEIGHTS", "./runs")
+        name = getattr(self.config, "YOLO_RUN_NAME", "estampas_detector")
+        hyp = getattr(self.config, "YOLO_HYP", None)  # ex.: "configs/hyp_estampas.yaml"
+        close_mosaic = getattr(self.config, "YOLO_CLOSE_MOSAIC", 10)
+        patience = getattr(self.config, "YOLO_PATIENCE", 30)
+        cos_lr = getattr(self.config, "YOLO_COS_LR", True)
+        optimizer = getattr(self.config, "YOLO_OPTIMIZER", "sgd")
+        lr0 = getattr(self.config, "YOLO_LR0", 0.005)
+        lrf = getattr(self.config, "YOLO_LRF", 0.1)
+        amp = getattr(self.config, "YOLO_AMP", True)
+
         results = self.model.train(
             data=dataset_path,
             epochs=epochs,
-            imgsz=self.config.YOLO_IMGSZ,
-            batch=16,
-            device=self.config.DEVICE,
-            project=self.config.DIR_YOLO_WEIGHTS,
-            name='estampas_detector',
-            exist_ok=True
+            imgsz=imgsz,
+            batch=batch,
+            device=device,
+            project=project,
+            name=name,
+            exist_ok=True,
+            hyp=hyp,
+            close_mosaic=close_mosaic,
+            patience=patience,
+            cos_lr=cos_lr,
+            optimizer=optimizer,
+            lr0=lr0,
+            lrf=lrf,
+            amp=amp
         )
-        
-        print(f"\n✓ Fine-tuning concluído!")
+
+        print("\n✓ Fine-tuning concluído!")
         return results
+    
+    #inferir diretamente a partir de um array BGR, evitando que a Ultralytics reabra o arquivo do disco
+    def detectar_estampa_array(self, image_bgr: "np.ndarray") -> Optional[Tuple[int, int, int, int]]:
+        """
+        Versão de detecção que recebe a imagem já carregada (BGR, OpenCV).
+        Evita overhead de I/O no Ultralytics ao passar caminhos de arquivo.
+        Retorna (x1, y1, x2, y2) ou None.
+        """
+        try:
+            results = self._predict_internal(image_bgr, stream=False)
+            if len(results) == 0 or results[0].boxes is None or len(results[0].boxes) == 0:
+                return None
+
+            boxes = results[0].boxes
+            xyxy = boxes.xyxy.cpu().numpy()
+            confidences = boxes.conf.cpu().numpy()
+
+            best_idx = self._choose_box_idx(xyxy, confidences)
+            if best_idx < 0:
+                return None
+
+            bbox = xyxy[best_idx].astype(int)
+            x1, y1, x2, y2 = int(bbox[0]), int(bbox[1]), int(bbox[2]), int(bbox[3])
+
+            # Clamping defensivo
+            x1, y1 = max(0, x1), max(0, y1)
+            x2, y2 = max(x1 + 1, x2), max(y1 + 1, y2)
+
+            return (x1, y1, x2, y2)
+
+        except Exception as e:
+            print(f"✗ Erro na detecção YOLOv8 (array): {e}")
+            return None
+        
+    #Ganho: elimina leitura dupla e conversão PIL, reduzindo centenas de milissegundos a segundos, conforme disco/FS.
+    @staticmethod
+    def extrair_estampa_array(image_bgr: "np.ndarray", bbox: Tuple[int, int, int, int]) -> Optional["np.ndarray"]:
+        """
+        Extrai recorte BGR direto via NumPy, sem PIL.
+        Retorna np.ndarray BGR ou None.
+        """
+        try:
+            x1, y1, x2, y2 = bbox
+            h, w = image_bgr.shape[:2]
+            x1 = int(max(0, min(x1, w - 1)))
+            y1 = int(max(0, min(y1, h - 1)))
+            x2 = int(max(1, min(x2, w)))
+            y2 = int(max(1, min(y2, h)))
+            if x2 <= x1 or y2 <= y1:
+                return None
+            return image_bgr[y1:y2, x1:x2].copy()
+        except Exception as e:
+            print(f"✗ Erro ao extrair estampa (array): {e}")
+            return None
 
 # ==================== SIAMESE NETWORK ====================
 class SiameseNetworkOptimized(nn.Module):
@@ -630,74 +843,152 @@ class ComparadorEstampasOptimized:
         
         print(f"✓ Sistema inicializado no dispositivo: {config.DEVICE}")
     
+    def _detector_fingerprint(self) -> str:
+        """
+        Gera um fingerprint do estado do detector que impacta o embedding:
+        - Nome do modelo YOLO (pesos)
+        - Parâmetros de inferência (conf, iou, imgsz)
+        - Estratégia de seleção (confidence/area)
+        - Flags de precisão (FP16)
+        """
+        try:
+            yolo_model_name = str(self.config.YOLO_MODEL)
+        except Exception:
+            yolo_model_name = "unknown"
+
+        parts = [
+            f"yolo={yolo_model_name}",
+            f"conf={getattr(self.config, 'YOLO_CONFIDENCE', None)}",
+            f"iou={getattr(self.config, 'YOLO_IOU_THRESHOLD', None)}",
+            f"imgsz={getattr(self.config, 'YOLO_IMGSZ', None)}",
+            f"sel={getattr(self.config, 'YOLO_SELECT_STRATEGY', 'confidence')}",
+            f"fp16={bool(getattr(self.config, 'USE_HALF_PRECISION', False))}"
+        ]
+        return "|".join(parts)
+
     def _carregar_cache(self):
-        """Carrega cache de embeddings"""
+        """
+        Carrega o cache e invalida automaticamente se o fingerprint do detector mudou.
+        Formato persistido:
+        {
+            'meta': {'fingerprint': str, 'version': int},
+            'items': { 'path_da_imagem': {'embedding': tensor, 'bbox': tuple} }
+        }
+        """
         cache_path = Path(self.config.CACHE_FILE)
-        if cache_path.exists():
-            self.embeddings_cache = torch.load(cache_path, map_location=self.config.DEVICE, weights_only=False)
-            print(f"✓ Cache carregado: {len(self.embeddings_cache)} embeddings")
-    
+        self.embeddings_cache = {}
+        self._cache_meta = {'fingerprint': self._detector_fingerprint(), 'version': 2}
+
+        if not cache_path.exists():
+            return
+
+        try:
+            data = torch.load(cache_path, map_location=self.config.DEVICE, weights_only=False)
+            if isinstance(data, dict) and 'meta' in data and 'items' in data:
+                old_fp = data['meta'].get('fingerprint', '')
+                if old_fp == self._cache_meta['fingerprint']:
+                    self.embeddings_cache = data['items']
+                    self._cache_meta = data['meta']
+                    print(f"✓ Cache carregado (compatível): {len(self.embeddings_cache)} embeddings")
+                else:
+                    print("⚠ Cache inválido (mudança no detector/parâmetros). Reconstrução necessária.")
+            else:
+                print("⚠ Formato de cache antigo. Será refeito.")
+        except Exception as e:
+            print(f"⚠ Falha ao carregar cache, será refeito: {e}")
+
     def _salvar_cache(self):
+        """
+        Salva cache com metadados para garantir consistência entre runs.
+        """
+        data = {
+            'meta': self._cache_meta,
+            'items': self.embeddings_cache
+        }
+        torch.save(data, self.config.CACHE_FILE)
         """Salva cache de embeddings"""
         torch.save(self.embeddings_cache, self.config.CACHE_FILE)
     
     def processar_imagem(self, imagem_path: str, usar_cache: bool = True) -> Tuple[Optional[torch.Tensor], Optional[Tuple]]:
         """
-        Pipeline: Detecta → Extrai → Gera embedding
+        Pipeline: Detecta → Extrai → Gera embedding.
+        Otimizado para evitar I/O duplicado e overhead de PIL/torchvision.
         COM FALLBACK: Se a detecção falhar, usa a imagem inteira.
         """
-        # Verifica cache
+        # Cache
         if usar_cache and imagem_path in self.embeddings_cache:
             return self.embeddings_cache[imagem_path]['embedding'], self.embeddings_cache[imagem_path]['bbox']
-        
-        # Detecta estampa
-        bbox = self.detector.detectar_estampa(imagem_path)
-        
-        # --- INÍCIO DA CORREÇÃO ---
+
+        # 1) Carrega uma única vez (BGR)
+        img_bgr = cv2.imread(imagem_path, cv2.IMREAD_COLOR)
+        if img_bgr is None:
+            print(f"   ✗ Falha ao ler {imagem_path}")
+            return None, None
+
+        # 2) Detecta com array em memória
+        bbox = self.detector.detectar_estampa_array(img_bgr)
+
+        # 3) Extrai recorte via NumPy. Fallback caso necessário
         if bbox is None:
-            # Se a detecção falhar, avisa e usa a imagem inteira como fallback
             print(f"   ⚠️  Detecção YOLOv8 falhou para {Path(imagem_path).name}. Usando imagem inteira (fallback)...")
-            try:
-                estampa = Image.open(imagem_path).convert('RGB')
-                # Cria um BBox virtual do tamanho da imagem para o cache
-                bbox = (0, 0, estampa.width, estampa.height) 
-            except Exception as e:
-                print(f"   ✗ Erro ao carregar imagem (fallback): {e}")
-                return None, None
+            h, w = img_bgr.shape[:2]
+            bbox = (0, 0, w, h)
+            crop_bgr = img_bgr
         else:
-            # Se a detecção funcionou, extrai a região
-            estampa = self.detector.extrair_estampa(imagem_path, bbox)
-        # --- FIM DA CORREÇÃO ---
-            
-        if estampa is None:
-            # Isso pode acontecer se o bbox for válido mas a extração falhar
+            crop_bgr = self.detector.extrair_estampa_array(img_bgr, bbox)
+
+        if crop_bgr is None:
             print(f"   ✗ Erro ao extrair estampa (bbox: {bbox})")
             return None, None
-        
-        # Gera embedding
-        estampa_tensor = self.transform(estampa).unsqueeze(0).to(self.config.DEVICE)
-        
+
+        # --- INÍCIO DA VERIFICAÇÃO VISUAL ---
+        # Salva o recorte EXATO que será usado
+        os.makedirs("./debug_crops", exist_ok=True)
+        debug_path = f"./debug_crops/CROP_{Path(imagem_path).name}"
+        cv2.imwrite(debug_path, crop_bgr)
+        # --- FIM DA VERIFICAÇÃO VISUAL ---
+
+        # 4) Pré-processamento rápido no CPU → GPU
+        #    - Resize fixo 224x224 
+        crop_bgr = cv2.resize(crop_bgr, (224, 224), interpolation=cv2.INTER_AREA)
+        crop_rgb = cv2.cvtColor(crop_bgr, cv2.COLOR_BGR2RGB)
+
+        #    - Converte para tensor float32 ou float16 diretamente
+        tensor = torch.from_numpy(crop_rgb).to(self.config.DEVICE)
+        tensor = tensor.permute(2, 0, 1).contiguous()  # HWC->CHW
+        tensor = tensor.float()
         if self.config.USE_HALF_PRECISION and self.config.DEVICE.type == 'cuda':
-            estampa_tensor = estampa_tensor.half()
-        
-        with torch.no_grad():
-            embedding = self.model(estampa_tensor)
-        
-        # Salva no cache
+            tensor = tensor.half()
+
+        #    - Normaliza [0,1] e aplica mean/std do ImageNet
+        tensor = tensor / 255.0
+        mean = torch.tensor([0.485, 0.456, 0.406], device=self.config.DEVICE, dtype=tensor.dtype).view(3, 1, 1)
+        std = torch.tensor([0.229, 0.224, 0.225], device=self.config.DEVICE, dtype=tensor.dtype).view(3, 1, 1)
+        tensor = (tensor - mean) * (1.0 / std)
+
+        tensor = tensor.unsqueeze(0)  # [1, 3, 224, 224]
+
+        # 5) Embedding (inference_mode para máxima velocidade)
+        with torch.inference_mode():
+            embedding = self.model(tensor)
+
+        # 6) Cache
         if usar_cache:
             self.embeddings_cache[imagem_path] = {
                 'embedding': embedding,
                 'bbox': bbox
             }
             self._salvar_cache()
-        
+
         return embedding, bbox
     
     def calcular_similaridade(self, embedding1, embedding2):
         """Calcula similaridade (vetorizado)"""
-        distance = F.pairwise_distance(embedding1, embedding2, p=2).item()
-        similarity = 1 - (distance / 2)
-        return similarity, distance
+        # Distância Euclidiana
+        # Vetorizado para máxima performance
+        distance = F.pairwise_distance(embedding1, embedding2, p=2).item() 
+        similarity = 1 - (distance / 2) 
+        return similarity, distance # Retorna também distância para info adicional
     
     def comparar_com_referencia(self, imagem_validacao_path: str):
         """
@@ -736,23 +1027,68 @@ class ComparadorEstampasOptimized:
         tempo_deteccao = time.time() - inicio_total
         print(f"✓ Detecção: {tempo_deteccao * 1000:.2f}ms")
         
-        # Processa referências (usa cache)
+        # Processa referências
         inicio_comparacao = time.time()
-        
+
+        imagens_ref = [
+            str(f) for f in dir_ref.iterdir()
+            if f.suffix.lower() in self.config.EXTENSOES_VALIDAS
+        ]
+        if not imagens_ref:
+            print("✗ Nenhuma imagem de referência")
+            return
+
+        # Lista das que faltam no cache
+        faltantes = [p for p in imagens_ref if p not in self.embeddings_cache]
+
+        # Se houver faltantes, processa em batch
+        if faltantes:
+            bboxes_refs = self.detector.detectar_batch(faltantes)
+            for img_ref, bbox_ref in zip(faltantes, bboxes_refs):
+                try:
+                    if bbox_ref is None:
+                        estampa_ref = Image.open(img_ref).convert('RGB')
+                        bbox_eff = (0, 0, estampa_ref.width, estampa_ref.height)
+                    else:
+                        estampa_ref = self.detector.extrair_estampa(img_ref, bbox_ref)
+                        bbox_eff = bbox_ref
+
+                    if estampa_ref is None:
+                        continue
+
+                    estampa_ref_tensor = self.transform(estampa_ref).unsqueeze(0).to(self.config.DEVICE)
+                    if self.config.USE_HALF_PRECISION and self.config.DEVICE.type == 'cuda':
+                        estampa_ref_tensor = estampa_ref_tensor.half()
+
+                    with torch.inference_mode():
+                        emb_ref = self.model(estampa_ref_tensor)
+
+                    if self.config.CACHE_EMBEDDINGS:
+                        self.embeddings_cache[img_ref] = {
+                            'embedding': emb_ref,
+                            'bbox': bbox_eff
+                        }
+                except Exception as e:
+                    print(f"✗ Falha ao processar referência {img_ref}: {e}")
+
+        # Seleciona melhor match
         melhor_match = None
-        melhor_similaridade = -1
-        
+        melhor_similaridade = -1.0
+
         for img_ref in imagens_ref:
-            emb_ref, _ = self.processar_imagem(img_ref, usar_cache=True)
-            
-            if emb_ref is None:
+            item = self.embeddings_cache.get(img_ref)
+            if not item:
                 continue
-            
+            emb_ref = item['embedding']
             similaridade, distancia = self.calcular_similaridade(emb_validacao, emb_ref)
-            
             if similaridade > melhor_similaridade:
                 melhor_similaridade = similaridade
                 melhor_match = Path(img_ref).name
+
+        if self.config.CACHE_EMBEDDINGS:
+            self._salvar_cache()
+
+        tempo_comparacao = time.time() - inicio_comparacao
         
         tempo_comparacao = time.time() - inicio_comparacao
         tempo_total = time.time() - inicio_total
@@ -769,6 +1105,61 @@ class ComparadorEstampasOptimized:
         print(f"   Status: {status}")
         print(f"   ⚡ Tempo Total: {tempo_total * 1000:.2f}ms")
         print(f"{'='*70}\n")
+
+    def rebuild_cache_referencias(self) -> None:
+        """
+        Reconstrói o cache de embeddings das imagens de referência usando SEMPRE o recorte da estampa.
+        Usa detecção em batch para maximizar throughput.
+        """
+        dir_ref = Path(self.config.DIR_REFERENCIA)
+        if not dir_ref.exists():
+            print("✗ Diretório de referência não encontrado para rebuild_cache_referencias")
+            return
+
+        imagens_ref = [
+            str(f) for f in dir_ref.iterdir()
+            if f.suffix.lower() in self.config.EXTENSOES_VALIDAS
+        ]
+        if not imagens_ref:
+            print("✗ Nenhuma imagem de referência para reconstruir cache")
+            return
+
+        print(f"🧱 Reconstruindo cache de referências ({len(imagens_ref)} imagens)...")
+
+        # 1) Detecção em lote
+        bboxes_refs = self.detector.detectar_batch(imagens_ref)
+
+        # 2) Extração + embedding (com FP16 se disponível)
+        for img_ref, bbox_ref in zip(imagens_ref, bboxes_refs):
+            try:
+                if bbox_ref is None:
+                    # Fallback: usa imagem inteira mas MARCA isso via bbox para diferenciar
+                    estampa_ref = Image.open(img_ref).convert('RGB')
+                    bbox_eff = (0, 0, estampa_ref.width, estampa_ref.height)
+                else:
+                    estampa_ref = self.detector.extrair_estampa(img_ref, bbox_ref)
+                    bbox_eff = bbox_ref
+
+                if estampa_ref is None:
+                    continue
+
+                estampa_ref_tensor = self.transform(estampa_ref).unsqueeze(0).to(self.config.DEVICE)
+                if self.config.USE_HALF_PRECISION and self.config.DEVICE.type == 'cuda':
+                    estampa_ref_tensor = estampa_ref_tensor.half()
+
+                with torch.inference_mode():
+                    emb_ref = self.model(estampa_ref_tensor)
+
+                self.embeddings_cache[img_ref] = {
+                    'embedding': emb_ref,
+                    'bbox': bbox_eff
+                }
+            except Exception as e:
+                print(f"✗ Falha ao processar referência {img_ref}: {e}")
+
+        self._cache_meta = {'fingerprint': self._detector_fingerprint(), 'version': 2}
+        self._salvar_cache()
+        print(f"✓ Cache reconstruído: {len(self.embeddings_cache)} embeddings")
 
 # ==================== MONITORAMENTO ====================
 class MonitoradorDiretorio(FileSystemEventHandler):

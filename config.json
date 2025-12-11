@@ -1,0 +1,10 @@
+{
+    "DIR_REFERENCIA": "./referencias",
+    "DIR_VALIDACAO": "./entrada_monitorada",
+    "DIR_CHECKPOINTS": "./models",
+    "DIR_YOLO_WEIGHTS": "./models",
+    "YOLO_MODEL": "estampa_yolov8n_best.pt",
+    "SIAMESE_MODEL": "fold_1_best.pth",
+    "THRESHOLD_SIMILARIDADE": 0.95,
+    "DEVICE": "cuda"
+}

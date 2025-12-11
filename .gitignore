@@ -8,6 +8,8 @@ venv/
 .venv/
 env/
 .env/
+build
+dist
 
 # 2. Cache e Artefatos do Python
 __pycache__/
