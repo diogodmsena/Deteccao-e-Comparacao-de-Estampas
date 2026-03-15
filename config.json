@@ -1,5 +1,5 @@
 {
-    "DIR_REFERENCIA": "./referencias",
+    "DIR_REFERENCIA": "./bandeira",
     "DIR_VALIDACAO": "./entrada_monitorada",
     "DIR_CHECKPOINTS": "./models",
     "DIR_YOLO_WEIGHTS": "./models",

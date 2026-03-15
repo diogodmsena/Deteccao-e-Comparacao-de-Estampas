@@ -1,9 +1,9 @@
 # -*- mode: python ; coding: utf-8 -*-
 from PyInstaller.utils.hooks import collect_all
 
-datas = [('config.json', '.')]
+datas = [('config.json', '.'), ('checkpoints', 'checkpoints'), ('models', 'models'), ('imagens_referencia', 'imagens_referencia'), ('imagens_validacao', 'imagens_validacao')]
 binaries = []
-hiddenimports = []
+hiddenimports = ['ultralytics', 'ultralytics.nn', 'ultralytics.yolo.engine.model', 'ultralytics.yolo.utils']
 tmp_ret = collect_all('ultralytics')
 datas += tmp_ret[0]; binaries += tmp_ret[1]; hiddenimports += tmp_ret[2]
 

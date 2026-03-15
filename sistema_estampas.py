@@ -27,6 +27,10 @@ import json
 from sklearn.model_selection import KFold
 import warnings
 warnings.filterwarnings('ignore')
+import sys
+
+# Forçar flush imediato da saída (crucial para subprocess)
+sys.stdout.reconfigure(line_buffering=True)
 
 # Importações para YOLOv8 (ultralytics)
 try:
@@ -49,8 +53,8 @@ class Config:
         print("⚠ config.json não encontrado, usando defaults do código.")
 
     # Diretórios (lendo do JSON ou usando default)
-    DIR_REFERENCIA = config_data.get("DIR_REFERENCIA", "./imagens_referencia")
-    DIR_VALIDACAO = config_data.get("DIR_VALIDACAO", "./imagens_validacao")
+    DIR_REFERENCIA = config_data.get("DIR_REFERENCIA", "./bandeira")
+    DIR_VALIDACAO = config_data.get("DIR_VALIDACAO", "./entrada_monitorada")
     DIR_CHECKPOINTS = config_data.get("DIR_CHECKPOINTS", "./checkpoints")
     DIR_YOLO_WEIGHTS = config_data.get("DIR_YOLO_WEIGHTS", "./models")
     
@@ -1009,12 +1013,12 @@ class ComparadorEstampasOptimized:
             print(f"✗ Nenhuma imagem de referência")
             return
         
-        print(f"\n{'='*70}")
+        print(f"\n{'='*40}")
         print(f"🔍 VALIDAÇÃO")
-        print(f"{'='*70}")
+        print(f"{'='*40}")
         print(f"📁 Imagem: {Path(imagem_validacao_path).name}")
         print(f"⏰ Timestamp: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
-        print(f"{'─'*70}\n")
+        # print(f"{'─'*40}")
         
         # Processa imagem de validação
         inicio_total = time.time()
@@ -1025,7 +1029,7 @@ class ComparadorEstampasOptimized:
             return
         
         tempo_deteccao = time.time() - inicio_total
-        print(f"✓ Detecção: {tempo_deteccao * 1000:.2f}ms")
+        # print(f"✓ Detecção: {tempo_deteccao * 1000:.2f}ms")
         
         # Processa referências
         inicio_comparacao = time.time()
@@ -1095,16 +1099,16 @@ class ComparadorEstampasOptimized:
         
         identicas = melhor_similaridade >= self.config.THRESHOLD_SIMILARIDADE
         status = "✓ IDÊNTICAS" if identicas else "✗ DIFERENTES"
-        
-        print(f"✓ Comparação: {tempo_comparacao * 1000:.2f}ms")
-        print(f"\n{'─'*70}")
-        print(f"🏆 RESULTADO:")
-        print(f"{'─'*70}")
-        print(f"   Match: {melhor_match}")
-        print(f"   Similaridade: {melhor_similaridade * 100:.2f}%")
-        print(f"   Status: {status}")
-        print(f"   ⚡ Tempo Total: {tempo_total * 1000:.2f}ms")
-        print(f"{'='*70}\n")
+
+        print(f"⚡ Tempo Total: {tempo_total * 1000:.2f}ms")  
+        print(f"   Similaridade: {melhor_similaridade * 100:.2f}%")              
+#        print(f"✓ Comparação: {tempo_comparacao * 1000:.2f}ms")
+#        print(f"\n{'─'*40}")
+        print(f"{'='*40}\n")  
+        print(f"🏆 RESULTADO: {status}\n")      
+#        print(f"{'─'*40}")        
+#        print(f"   Status: {status}")
+        print(f"{'='*40}\n")
 
     def rebuild_cache_referencias(self) -> None:
         """
@@ -1225,10 +1229,10 @@ def treinar_modelo_kfold():
     print(f"✓ Treinamento concluído!")
 
 def executar_sistema(usar_modelo_treinado=True):
-    """Executa sistema"""
-    print("\n" + "="*70)
+    """Executa sistema com suporte a carregamento direto do Config"""
+    print("\n" + "="*40)
     print("🚀 SISTEMA DE COMPARAÇÃO DE ESTAMPAS")
-    print("="*70 + "\n")
+    print("="*40 + "\n")
     
     config = Config()
     
@@ -1237,19 +1241,36 @@ def executar_sistema(usar_modelo_treinado=True):
     Path(config.DIR_VALIDACAO).mkdir(exist_ok=True)
     Path(config.DIR_YOLO_WEIGHTS).mkdir(exist_ok=True)
     
-    # Carrega modelo
     modelo_path = None
+    
     if usar_modelo_treinado:
-        # Usa o melhor fold
-        history_path = Path(config.DIR_CHECKPOINTS) / "kfold_history.json"
-        if history_path.exists():
-            with open(history_path, 'r') as f:
-                history = json.load(f)
-            best_fold = history['best_fold']
-            modelo_path = Path(config.DIR_CHECKPOINTS) / f"fold_{best_fold}_best.pth"
+        # TENTATIVA 1: Tenta carregar nome definido no config.json (Prioridade para Produção)
+        nome_modelo_config = getattr(config, "SIAMESE_MODEL", None)
+        if nome_modelo_config:
+            caminho_direto = Path(config.DIR_CHECKPOINTS) / nome_modelo_config
+            if caminho_direto.exists():
+                modelo_path = caminho_direto
+                print(f"✓ Modelo selecionado via Config: {modelo_path.name}")
         
+        # TENTATIVA 2: Se não achou no config, tenta via histórico (Legado/Treinamento)
+        if modelo_path is None:
+            history_path = Path(config.DIR_CHECKPOINTS) / "kfold_history.json"
+            if history_path.exists():
+                try:
+                    with open(history_path, 'r') as f:
+                        history = json.load(f)
+                    best_fold = history.get('best_fold', 1)
+                    potencial_path = Path(config.DIR_CHECKPOINTS) / f"fold_{best_fold}_best.pth"
+                    if potencial_path.exists():
+                        modelo_path = potencial_path
+                        print(f"✓ Modelo selecionado via Histórico: {modelo_path.name}")
+                except Exception as e:
+                    print(f"⚠ Erro ao ler histórico: {e}")
+
         if not modelo_path or not modelo_path.exists():
-            print("⚠️  Modelo treinado não encontrado. Usando modelo base.")
+            print("⚠️  CRÍTICO: Modelo treinado não encontrado nos caminhos esperados.")
+            print(f"   Procurado em: {config.DIR_CHECKPOINTS}")
+            print("   Usando modelo BASE (sem treinamento). Resultados serão inválidos.")
             modelo_path = None
     
     # Inicializa comparador
@@ -1273,10 +1294,11 @@ def executar_sistema(usar_modelo_treinado=True):
     observer = Observer()
     observer.schedule(event_handler, config.DIR_VALIDACAO, recursive=False)
     observer.start()
+    # --------------------------------------------------
     
     print(f"👁️  Monitorando: {config.DIR_VALIDACAO}")
     print("⚡ Sistema ativo!\n")
-    print("   (Pressione Ctrl+C para encerrar)\n")
+    # print("   (Pressione Ctrl+C para encerrar)\n")
     
     try:
         while True:
@@ -1311,7 +1333,7 @@ def main():
         print("="*70 + "\n")
         print("1. Treinar modelo (K-Fold Cross-Validation)")
         print("2. Executar sistema (modelo treinado)")
-        print("3. Executar sistema (modelo base)")
+        # print("3. Executar sistema (modelo base)")
         print("0. Sair\n")
         
         opcao = input("Opção: ").strip()
