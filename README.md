@@ -309,15 +309,3 @@ O sistema incorpora mecanismos robustos de tratamento de erros e logging. Erros 
 * **Interface Gráfica (GUI):** Criar uma interface gráfica do usuário para facilitar a interação com o sistema para usuários não técnicos.
 * **Otimização de Quantização:** Implementar quantização de modelo (ex: INT8) para reduzir ainda mais o tamanho do modelo e acelerar a inferência em hardware específico.
 * **Indexação de Embeddings:** Utilizar bibliotecas de busca de vizinhos mais próximos eficientes (ex: Faiss) para acelerar a comparação de embeddings em larga escala.
-
-### Licença
-
----
-
-### Contribuidores
-
----
-
-### Contato
-
----
