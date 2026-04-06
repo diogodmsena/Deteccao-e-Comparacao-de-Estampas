@@ -58,4 +58,4 @@ imagens_validacao/*
 
 monitored_input/*
 !monitored_input/.gitkeep
-models
+models/*

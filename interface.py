@@ -76,13 +76,13 @@ class InterfaceInspecao(ctk.CTk):
         self.btn_setup.grid(row=0, column=0, padx=10, pady=15)
 
         self.btn_contagem1 = ctk.CTkButton(self.frame_botoes, text="🔢 Contagem 1x", fg_color="#d9480f", hover_color="#b83c0c", command=self.rodar_contagem_1x)
-        self.btn_contagem1.grid(row=0, column=1, padx=10, pady=15)
+        self.btn_contagem1.grid(row=0, column=2, padx=10, pady=15)
 
         self.btn_contagem2 = ctk.CTkButton(self.frame_botoes, text="🔢 Contagem 2x", fg_color="#d9480f", hover_color="#b83c0c", command=self.rodar_contagem_2x)
-        self.btn_contagem2.grid(row=0, column=2, padx=10, pady=15)
+        self.btn_contagem2.grid(row=0, column=3, padx=10, pady=15)
 
         self.btn_diogo = ctk.CTkButton(self.frame_botoes, text="🔍 Análise YOLO", fg_color="#2b8a3e", hover_color="#237032", command=self.rodar_diogo)
-        self.btn_diogo.grid(row=0, column=3, padx=10, pady=15)
+        self.btn_diogo.grid(row=0, column=1, padx=10, pady=15)
 
         # --- FRAME DE TEXTO / LOG (BASE) ---
         self.frame_log = ctk.CTkFrame(self)
@@ -205,12 +205,12 @@ class InterfaceInspecao(ctk.CTk):
         self.executar_script_background("python script_setup.py", "SETUP")
 
     def rodar_contagem_1x(self):
-        self.log(">> A iniciar modelo de contagem 1x do Lucas...")
-        self.executar_script_background("python contagem.py", "LUCAS_1X")
+        self.log(">> A iniciar modelo de contagem 1x ...")
+        self.executar_script_background("python contagem.py", "COUNT_1X")
 
     def rodar_contagem_2x(self):
-        self.log(">> A iniciar modelo de contagem 2x (Carrossel) do Lucas...")
-        self.executar_script_background("python contagem_2x.py", "LUCAS_2X")
+        self.log(">> A iniciar modelo de contagem 2x (Carrossel) ...")
+        self.executar_script_background("python contagem_2x.py", "COUNT_2X")
 
     def rodar_diogo(self):
         self.log(">> A iniciar deteção YOLO e Siamese Network...")
